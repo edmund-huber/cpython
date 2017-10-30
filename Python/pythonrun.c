@@ -1869,6 +1869,25 @@ PyOS_CheckStack(void)
 
 /* Wrappers around sigaction() or signal(). */
 
+extern void signal_handler_true(int, siginfo_t *, void *);
+extern void signal_handler(int);
+
+#ifdef HAVE_SIGACTION
+PyOS_sighandler_t
+PyOS_getsig_inner(struct sigaction *context) {
+    if (context->sa_flags & SA_SIGINFO) {
+        if (context->sa_sigaction == signal_handler_true) {
+            return signal_handler;
+        } else {
+            puts("PyOS_getsig_inner: unexpected sa_sigction");
+            exit(1);
+        }
+    } else {
+        return context->sa_handler;
+    }
+}
+#endif
+
 PyOS_sighandler_t
 PyOS_getsig(int sig)
 {
@@ -1876,7 +1895,7 @@ PyOS_getsig(int sig)
     struct sigaction context;
     if (sigaction(sig, NULL, &context) == -1)
         return SIG_ERR;
-    return context.sa_handler;
+    return PyOS_getsig_inner(&context);
 #else
     PyOS_sighandler_t handler;
 /* Special signal handling for the secure CRT in Visual Studio 2005 */
@@ -1912,12 +1931,17 @@ PyOS_setsig(int sig, PyOS_sighandler_t handler)
      * changes to invalidate that assumption.
      */
     struct sigaction context, ocontext;
-    context.sa_handler = handler;
     sigemptyset(&context.sa_mask);
-    context.sa_flags = 0;
+    if (handler == signal_handler) {
+        context.sa_sigaction = signal_handler_true;
+        context.sa_flags = SA_SIGINFO;
+    } else {
+        context.sa_handler = handler;
+        context.sa_flags = 0;
+    }
     if (sigaction(sig, &context, &ocontext) == -1)
         return SIG_ERR;
-    return ocontext.sa_handler;
+    return PyOS_getsig_inner(&ocontext);
 #else
     PyOS_sighandler_t oldhandler;
     oldhandler = signal(sig, handler);

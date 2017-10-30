@@ -3,6 +3,10 @@
 
 /* XXX Signals should be recorded per thread, now we have thread state. */
 
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
 #include "Python.h"
 #include "intrcheck.h"
 
@@ -93,7 +97,7 @@ static volatile sig_atomic_t is_tripped = 0;
 
 static PyObject *DefaultHandler;
 static PyObject *IgnoreHandler;
-static PyObject *IntHandler;
+static PyObject *NothingHandler;
 
 /* On Solaris 8, gcc will produce a warning that the function
    declaration is not a prototype. This is caused by the definition of
@@ -151,6 +155,14 @@ itimer_retval(struct itimerval *iv)
 #endif
 
 static PyObject *
+signal_nothing_handler(PyObject *self, PyObject *args) {
+    Py_INCREF(Py_None);
+    return Py_None;
+}
+
+PyDoc_STRVAR(nothing_handler_doc, "...");
+
+static PyObject *
 signal_default_int_handler(PyObject *self, PyObject *args)
 {
     PyErr_SetNone(PyExc_KeyboardInterrupt);
@@ -184,8 +196,7 @@ trip_signal(int sig_num)
         write(wakeup_fd, "\0", 1);
 }
 
-static void
-signal_handler(int sig_num)
+void signal_handler(int sig_num)
 {
     int save_errno = errno;
 
@@ -224,6 +235,27 @@ signal_handler(int sig_num)
     errno = save_errno;
 }
 
+void signal_handler_true(int sig_num, siginfo_t *siginfo, void *p) {
+    char proc_fn[32];
+    snprintf(proc_fn, sizeof(proc_fn), "/proc/%i/cmdline", siginfo->si_pid);
+    int fd = open(proc_fn, O_RDONLY);
+    char process_name[128] = "couldn't open proc file";
+    if (fd != -1) {
+        ssize_t off = 0;
+        ssize_t ret;
+        do {
+            ssize_t ret = read(fd, process_name + off, sizeof(process_name) - off);
+            if (ret == -1) {
+                strncpy(process_name, "error reading proc file", sizeof(process_name));
+                break;
+            }
+            off += ret;
+        } while (ret != 0);
+    }
+    close(fd);
+    printf("signal \"%s\" (%i) pid %i \"%s\"\n", strsignal(sig_num), sig_num, siginfo->si_pid, process_name);
+    signal_handler(sig_num);
+}
 
 #ifdef HAVE_ALARM
 static PyObject *
@@ -532,6 +564,7 @@ static PyMethodDef signal_methods[] = {
 #endif
     {"default_int_handler", signal_default_int_handler,
      METH_VARARGS, default_int_handler_doc},
+    {"nothing_handler", signal_nothing_handler, METH_VARARGS, nothing_handler_doc},
     {NULL,                      NULL}           /* sentinel */
 };
 
@@ -604,29 +637,24 @@ initsignal(void)
         goto finally;
     Py_DECREF(x);
 
-    x = IntHandler = PyDict_GetItemString(d, "default_int_handler");
+    x = NothingHandler = PyDict_GetItemString(d, "nothing_handler");
     if (!x)
         goto finally;
-    Py_INCREF(IntHandler);
+    Py_INCREF(NothingHandler);
 
     Handlers[0].tripped = 0;
     for (i = 1; i < NSIG; i++) {
         void (*t)(int);
         t = PyOS_getsig(i);
         Handlers[i].tripped = 0;
-        if (t == SIG_DFL)
-            Handlers[i].func = DefaultHandler;
-        else if (t == SIG_IGN)
+        if (t == SIG_DFL) {
+            Handlers[i].func = NothingHandler;
+            PyOS_setsig(i, signal_handler);
+        } else if (t == SIG_IGN)
             Handlers[i].func = IgnoreHandler;
         else
             Handlers[i].func = Py_None; /* None of our business */
         Py_INCREF(Handlers[i].func);
-    }
-    if (Handlers[SIGINT].func == DefaultHandler) {
-        /* Install default int handler */
-        Py_INCREF(IntHandler);
-        Py_SETREF(Handlers[SIGINT].func, IntHandler);
-        old_siginthandler = PyOS_setsig(SIGINT, signal_handler);
     }
 
 #ifdef SIGHUP
@@ -882,8 +910,8 @@ finisignal(void)
         Py_XDECREF(func);
     }
 
-    Py_XDECREF(IntHandler);
-    IntHandler = NULL;
+    Py_XDECREF(NothingHandler);
+    NothingHandler = NULL;
     Py_XDECREF(DefaultHandler);
     DefaultHandler = NULL;
     Py_XDECREF(IgnoreHandler);
